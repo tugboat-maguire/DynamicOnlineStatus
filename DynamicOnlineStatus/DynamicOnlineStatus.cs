@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
@@ -14,7 +14,7 @@ namespace DynamicOnlineStatus;
 
 #pragma warning disable CA1812 // ASF uses this class during runtime
 [UsedImplicitly]
-internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarmerInfo, IBotModules, IBotCommand2 {
+internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarmerInfo, IBotModules {
 	public string Name => nameof(DynamicOnlineStatus);
 	public string RepositoryName => "tugboat-maguire/DynamicOnlineStatus";
 	public Version Version => typeof(DynamicOnlineStatus).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
@@ -40,21 +40,6 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 		}
 
 		return Task.CompletedTask;
-	}
-
-	public Task<string?> OnBotCommand(Bot bot, EAccess access, string message, string[] args, ulong steamID = 0) {
-		if (string.Equals(message, "teststart", StringComparison.OrdinalIgnoreCase)) {
-			_ = OnBotFarmingStarted(bot);
-			return Task.FromResult<string?>("Diagnostic: Simulating Farming Started. Status forcing to Online.");
-		}
-
-		if (string.Equals(message, "teststop", StringComparison.OrdinalIgnoreCase)) {
-			_ = OnBotFarmingStopped(bot);
-			_ = OnBotFarmingFinished(bot, false);
-			return Task.FromResult<string?>("Diagnostic: Simulating Farming Stopped. Status forcing to Invisible (10s delay).");
-		}
-
-		return Task.FromResult<string?>(null);
 	}
 
 	public static Task OnBotFarmingSurpassed(Bot bot) {
