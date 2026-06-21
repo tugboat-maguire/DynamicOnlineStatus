@@ -9,7 +9,7 @@
 		":disableDependencyDashboard",
 		":disableRateLimiting",
 		":label(🤖 Automatic)",
-		":reviewer(JustArchi)"
+		":reviewer(tugboat-maguire)"
 	],
 
 	"git-submodules": {
