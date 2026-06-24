@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
@@ -19,7 +18,9 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 	public string RepositoryName => "tugboat-maguire/DynamicOnlineStatus";
 	public Version Version => typeof(DynamicOnlineStatus).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	private static readonly ConcurrentDictionary<string, bool> EnabledBots = new();
+	// Modern C# record for thread-safe multi-variable state management
+	private sealed record PluginBotConfig(bool IsEnabled, int IdleDelaySeconds);
+	private static readonly ConcurrentDictionary<string, PluginBotConfig> BotConfigs = new();
 
 	public Task OnLoaded() {
 		ASF.ArchiLogger.LogGenericInfo($"Hello {Name}!");
@@ -28,42 +29,45 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 
 	public Task OnBotInitModules(Bot bot, IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 		if (additionalConfigProperties == null) {
-			EnabledBots[bot.BotName] = false;
+			BotConfigs[bot.BotName] = new PluginBotConfig(false, 10);
 			return Task.CompletedTask;
 		}
 
-		if (additionalConfigProperties.TryGetValue("EnableDynamicStatus", out JsonElement jsonElement) && (jsonElement.ValueKind == JsonValueKind.True)) {
-			EnabledBots[bot.BotName] = true;
-			bot.ArchiLogger.LogGenericInfo("Dynamic Online Status initialized and ENABLED.");
-		} else {
-			EnabledBots[bot.BotName] = false;
+		bool isEnabled = additionalConfigProperties.TryGetValue("EnableDynamicStatus", out JsonElement enabledElement) && (enabledElement.ValueKind == JsonValueKind.True);
+
+		// Safely parse the optional delay, defaulting to 10 if missing or malformed
+		int delaySeconds = 10;
+		if (additionalConfigProperties.TryGetValue("IdleDelaySeconds", out JsonElement delayElement) && (delayElement.ValueKind == JsonValueKind.Number)) {
+			if (delayElement.TryGetInt32(out int parsedDelay) && parsedDelay >= 0) {
+				delaySeconds = parsedDelay;
+			}
 		}
 
-		return Task.CompletedTask;
-	}
+		BotConfigs[bot.BotName] = new PluginBotConfig(isEnabled, delaySeconds);
 
-	public static Task OnBotFarmingSurpassed(Bot bot) {
+		if (isEnabled) {
+			bot.ArchiLogger.LogGenericInfo($"Dynamic Online Status ENABLED. Idle delay: {delaySeconds}s.");
+		}
+
 		return Task.CompletedTask;
 	}
 
 	public Task OnBotFarmingStarted(Bot bot) {
-		if (!EnabledBots.GetValueOrDefault(bot.BotName, false)) {
+		if (!BotConfigs.TryGetValue(bot.BotName, out PluginBotConfig? config) || !config.IsEnabled) {
 			return Task.CompletedTask;
 		}
 
 		bot.ArchiLogger.LogGenericInfo("Started farming. Setting status to Online.");
 
-		_ = Task.Run(() => {
-			if (bot.IsConnectedAndLoggedOn) {
-				SetPersonaStateSafe(bot, EPersonaState.Online);
-			}
-		});
+		if (bot.IsConnectedAndLoggedOn) {
+			SetPersonaState(bot, EPersonaState.Online);
+		}
 
 		return Task.CompletedTask;
 	}
 
 	public Task OnBotFarmingFinished(Bot bot, bool farmedSomething) {
-		// Silenced. We rely purely on OnBotFarmingStopped to prevent duplicate network calls.
+		// Silenced. Finished fires immediately before Stopped. We rely purely on Stopped to prevent duplicate network calls.
 		return Task.CompletedTask;
 	}
 
@@ -72,47 +76,38 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 	}
 
 	private static Task HandleIdleState(Bot bot, string reason) {
-		if (!EnabledBots.GetValueOrDefault(bot.BotName, false)) {
+		if (!BotConfigs.TryGetValue(bot.BotName, out PluginBotConfig? config) || !config.IsEnabled) {
 			return Task.CompletedTask;
 		}
 
-		bot.ArchiLogger.LogGenericInfo($"{reason} farming. Waiting 10 seconds before going Invisible...");
+		bot.ArchiLogger.LogGenericInfo($"{reason} farming. Waiting {config.IdleDelaySeconds} seconds before going Invisible...");
 
 		_ = Task.Run(async () => {
-			await Task.Delay(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+			try {
+				await Task.Delay(TimeSpan.FromSeconds(config.IdleDelaySeconds)).ConfigureAwait(false);
 
-			bool isFarming = bot.CardsFarmer.NowFarming;
+				// Safely checks NowFarming. If CardsFarmer is null (bot disconnected during delay), defaults to false.
+				bool isFarming = bot.CardsFarmer?.NowFarming ?? false;
 
-			if (bot.IsConnectedAndLoggedOn && !isFarming) {
-				bot.ArchiLogger.LogGenericInfo("Remained idle. Setting status to Invisible.");
-				SetPersonaStateSafe(bot, EPersonaState.Invisible);
-			} else {
-				bot.ArchiLogger.LogGenericInfo("Resumed farming or disconnected during the delay. Aborting state change.");
+				if (bot.IsConnectedAndLoggedOn && !isFarming) {
+					bot.ArchiLogger.LogGenericInfo("Remained idle. Setting status to Invisible.");
+					SetPersonaState(bot, EPersonaState.Invisible);
+				} else {
+					bot.ArchiLogger.LogGenericInfo("Resumed farming or disconnected during the delay. Aborting state change.");
+				}
+			} catch (Exception ex) {
+				bot.ArchiLogger.LogGenericError($"DynamicOnlineStatus background task faulted: {ex.Message}");
 			}
 		});
 
 		return Task.CompletedTask;
 	}
 
-	// Safely injects the state change using Reflection to bypass runtime accessibility limits
-	private static void SetPersonaStateSafe(Bot bot, EPersonaState state) {
+	private static void SetPersonaState(Bot bot, EPersonaState state) {
 		try {
-			// Extract SteamFriends directly from the Bot instance, ignoring visibility limits
-			PropertyInfo? steamFriendsProp = typeof(Bot).GetProperty("SteamFriends", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-
-			if (steamFriendsProp?.GetValue(bot) is SteamFriends steamFriends) {
-				steamFriends.SetPersonaState(state);
-				return;
-			}
-
-			// Fallback: Access the SteamClient and extract the handler
-			PropertyInfo? steamClientProp = typeof(Bot).GetProperty("SteamClient", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-
-			if (steamClientProp?.GetValue(bot) is SteamClient steamClient) {
-				steamClient.GetHandler<SteamFriends>()?.SetPersonaState(state);
-			} else {
-				bot.ArchiLogger.LogGenericError("DynamicOnlineStatus: Failed to locate SteamKit network handlers via Reflection.");
-			}
+			// [PublicAPI] - direct access, no reflection needed
+			bot.SteamFriends.SetPersonaState(state);
+			bot.ArchiLogger.LogGenericInfo($"Persona state successfully set to: {state}");
 		} catch (Exception ex) {
 			bot.ArchiLogger.LogGenericError($"DynamicOnlineStatus Exception: {ex.Message}");
 		}
