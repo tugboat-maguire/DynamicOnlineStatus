@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
 using ArchiSteamFarm.Steam;
@@ -18,12 +19,13 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 	public string RepositoryName => "tugboat-maguire/DynamicOnlineStatus";
 	public Version Version => typeof(DynamicOnlineStatus).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	// Modern C# record for thread-safe multi-variable state management
 	private sealed record PluginBotConfig(bool IsEnabled, int IdleDelaySeconds);
 	private static readonly ConcurrentDictionary<string, PluginBotConfig> BotConfigs = new();
 
+	// Tracks active cancellation tokens for pending background tasks
+	private static readonly ConcurrentDictionary<string, CancellationTokenSource> PendingIdleTasks = new();
+
 	public Task OnLoaded() {
-		ASF.ArchiLogger.LogGenericInfo($"Hello {Name}!");
 		return Task.CompletedTask;
 	}
 
@@ -35,7 +37,6 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 
 		bool isEnabled = additionalConfigProperties.TryGetValue("EnableDynamicStatus", out JsonElement enabledElement) && (enabledElement.ValueKind == JsonValueKind.True);
 
-		// Safely parse the optional delay, defaulting to 10 if missing or malformed
 		int delaySeconds = 10;
 		if (additionalConfigProperties.TryGetValue("IdleDelaySeconds", out JsonElement delayElement) && (delayElement.ValueKind == JsonValueKind.Number)) {
 			if (delayElement.TryGetInt32(out int parsedDelay) && parsedDelay >= 0) {
@@ -57,6 +58,9 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 			return Task.CompletedTask;
 		}
 
+		// Proactively terminate any pending Invisible state changes
+		CancelPendingIdleTask(bot);
+
 		bot.ArchiLogger.LogGenericInfo("Started farming. Setting status to Online.");
 
 		if (bot.IsConnectedAndLoggedOn) {
@@ -67,7 +71,6 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 	}
 
 	public Task OnBotFarmingFinished(Bot bot, bool farmedSomething) {
-		// Silenced. Finished fires immediately before Stopped. We rely purely on Stopped to prevent duplicate network calls.
 		return Task.CompletedTask;
 	}
 
@@ -80,13 +83,19 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 			return Task.CompletedTask;
 		}
 
+		// Ensure rapid Stop-Start-Stop cycles do not queue duplicate network calls
+		CancelPendingIdleTask(bot);
+
+		CancellationTokenSource cts = new();
+		PendingIdleTasks[bot.BotName] = cts;
+
 		bot.ArchiLogger.LogGenericInfo($"{reason} farming. Waiting {config.IdleDelaySeconds} seconds before going Invisible...");
 
 		_ = Task.Run(async () => {
 			try {
-				await Task.Delay(TimeSpan.FromSeconds(config.IdleDelaySeconds)).ConfigureAwait(false);
+				// Pass the token to the delay. If cancelled, it throws an OperationCanceledException
+				await Task.Delay(TimeSpan.FromSeconds(config.IdleDelaySeconds), cts.Token).ConfigureAwait(false);
 
-				// Safely checks NowFarming. If CardsFarmer is null (bot disconnected during delay), defaults to false.
 				bool isFarming = bot.CardsFarmer?.NowFarming ?? false;
 
 				if (bot.IsConnectedAndLoggedOn && !isFarming) {
@@ -95,17 +104,30 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 				} else {
 					bot.ArchiLogger.LogGenericInfo("Resumed farming or disconnected during the delay. Aborting state change.");
 				}
+			} catch (OperationCanceledException) {
+				bot.ArchiLogger.LogGenericInfo("Pending idle state change was cleanly cancelled by a new bot event.");
 			} catch (Exception ex) {
 				bot.ArchiLogger.LogGenericError($"DynamicOnlineStatus background task faulted: {ex.Message}");
+			} finally {
+				// Atomically remove the CTS only if it exactly matches the one this thread created
+				if (PendingIdleTasks.TryRemove(new KeyValuePair<string, CancellationTokenSource>(bot.BotName, cts))) {
+					cts.Dispose();
+				}
 			}
 		});
 
 		return Task.CompletedTask;
 	}
 
+	private static void CancelPendingIdleTask(Bot bot) {
+		if (PendingIdleTasks.TryRemove(bot.BotName, out CancellationTokenSource? oldCts)) {
+			oldCts.Cancel();
+			oldCts.Dispose();
+		}
+	}
+
 	private static void SetPersonaState(Bot bot, EPersonaState state) {
 		try {
-			// [PublicAPI] - direct access, no reflection needed
 			bot.SteamFriends.SetPersonaState(state);
 			bot.ArchiLogger.LogGenericInfo($"Persona state successfully set to: {state}");
 		} catch (Exception ex) {
