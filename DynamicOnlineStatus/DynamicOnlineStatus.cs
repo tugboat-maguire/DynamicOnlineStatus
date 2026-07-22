@@ -47,7 +47,7 @@ internal sealed class DynamicOnlineStatus : IGitHubPluginUpdates, IBotCardsFarme
 		BotConfigs[bot.BotName] = new PluginBotConfig(isEnabled, delaySeconds);
 
 		if (isEnabled) {
-			bot.ArchiLogger.LogGenericInfo($"Dynamic Online Status ENABLED. Idle delay: {delaySeconds}s.");
+			bot.ArchiLogger.LogGenericInfo($"DynamicOnlineStatus is enabled. Idle delay: {delaySeconds}s.");
 		}
 
 		return Task.CompletedTask;
